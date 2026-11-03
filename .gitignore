@@ -17,3 +17,8 @@ discord_notifications.json
 # ローカルwheelキャッシュ
 wheels/
 download_wheels.py
+
+# PyInstallerビルド成果物
+build/
+dist/
+*.spec
