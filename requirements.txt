@@ -7,3 +7,5 @@ winrt-Windows.Data.Xml.Dom>=4!10.0.28000.2957
 winrt-Windows.ApplicationModel>=4!10.0.28000.2957
 winrt-Windows.Storage.Streams>=4!10.0.28000.2957
 typing-extensions>=4.12.2
+pystray>=0.19.5
+Pillow>=10.0.0
