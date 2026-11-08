@@ -32,7 +32,7 @@ jobs:
 
       - name: PyInstallerによる.exeビルド
         run: |
-          pyinstaller --noconsole --onefile --icon=icon.ico --name=DiscordNotifyManager --collect-all winrt --collect-all pystray --collect-all PIL main.py
+          pyinstaller --noconsole --onefile --icon=icon.ico --name=DiscordNotifyManager --collect-all winrt --collect-all pystray --collect-all PIL --collect-all customtkinter main.py
 
       - name: GitHub Releasesへの公開デプロイ
         uses: softprops/action-gh-release@v2

@@ -11,8 +11,9 @@ __pycache__/
 # 一時ファイル
 *.tmp
 
-# ローカル通知ログ（個人情報を含むためGit管理対象外に推奨）
+# ローカル通知ログ・個別設定（Git管理対象外）
 discord_notifications.json
+config.json
 
 # ローカルwheelキャッシュ
 wheels/

@@ -1,9 +1,10 @@
 """
 Discord通知マネージャー (discordNotifyManager)
-Windows 11環境でDiscordの通知を常時監視し、3秒後に自動削除しながらJSONにログ保存する常駐ツール
+Windows 11環境でDiscordの通知を常時監視し、指定秒数後に自動削除しながらJSONにログ保存する常駐ツール
 - タスクトレイ常駐機能（pystray）
+- モダンな管理画面GUI（CustomTkinter: ui.py）
+- 設定の一元管理（config.json: config.py）
 - Windowsスタートアップ自動起動機能（winreg）
-- 一時停止・再開トグル機能
 """
 
 import asyncio
@@ -14,7 +15,7 @@ import re
 import sys
 import threading
 import winreg
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # WindowsコンソールでのUnicode (絵文字や特殊文字) 出力エラー防止 & リアルタイム出力
 if sys.platform == "win32" and sys.stdout:
@@ -26,6 +27,10 @@ if sys.platform == "win32" and sys.stdout:
 # 画像生成 (Pillow) とタスクトレイ (pystray) のインポート
 from PIL import Image, ImageDraw
 import pystray
+
+# 設定モジュール & GUIモジュールのインポート
+import config
+import ui
 
 # WinRT API のインポート
 try:
@@ -39,17 +44,8 @@ except ImportError as e:
 # ==============================================================================
 # 基本設定・パス解決
 # ==============================================================================
-# スタートアップ起動時にも正常に動作するよう、スクリプト/exeの絶対配置ディレクトリを基準にする
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# 保存先JSONファイル名
+BASE_DIR = config.BASE_DIR
 LOG_FILE = os.path.join(BASE_DIR, "discord_notifications.json")
-
-# 自動削除までの待機時間（秒）
-AUTO_DELETE_DELAY_SECONDS = 3
 
 # 監視ポーリング間隔（秒）
 POLLING_INTERVAL_SECONDS = 0.5
@@ -58,9 +54,9 @@ POLLING_INTERVAL_SECONDS = 0.5
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_APP_NAME = "DiscordNotifyManager"
 
-# グローバル状態管理
-is_auto_delete_enabled = True  # 自動削除が有効か（トレイから一時停止可能）
+# グローバルインスタンス
 tray_icon: Optional[pystray.Icon] = None
+ui_app: Optional[ui.DiscordNotifyManagerUI] = None
 stop_event = threading.Event()  # アプリ全体の終了シグナル
 
 
@@ -85,12 +81,9 @@ def set_startup_enabled(enable: bool) -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
             if enable:
-                # 実行コマンドの作成
                 if getattr(sys, "frozen", False):
-                    # PyInstaller 等で .exe 化されている場合
                     cmd = f'"{os.path.abspath(sys.executable)}"'
                 else:
-                    # スクリプト実行時は、黒いコンソールが出ない pythonw.exe を優先指定
                     python_exe = sys.executable
                     pythonw_exe = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
                     if not os.path.exists(pythonw_exe):
@@ -117,7 +110,6 @@ def set_startup_enabled(enable: bool) -> bool:
 # ==============================================================================
 def create_tray_image(enabled: bool = True) -> Image.Image:
     """タスクトレイ用のアイコン画像を動的生成する関数（Discordカラー＋吹き出し＋稼働状態ドット）"""
-    # 64x64ピクセルのRGBA画像を作成
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -143,13 +135,16 @@ def clean_discord_text(text: str) -> str:
     """Discord通知に含まれるUnicode方向制御文字などを除去して綺麗にする関数"""
     if not text:
         return ""
-    # Discordのチャンネル名等に付与される \u2068, \u2069 などを除去
     cleaned = re.sub(r"[\u2066-\u2069\u202a-\u202e]", "", text)
     return cleaned.strip()
 
 
 def save_notification_log(entry: dict):
-    """通知情報を discord_notifications.json に安全に追記保存する関数"""
+    """通知情報を discord_notifications.json に安全に追記保存する関数（最大件数制限付き）"""
+    cfg = config.get_config()
+    max_count = cfg.get("max_log_count", 500)
+    pinned_ids = set(cfg.get("pinned_notification_ids", []))
+
     data = []
     if os.path.exists(LOG_FILE):
         try:
@@ -163,24 +158,46 @@ def save_notification_log(entry: dict):
 
     data.append(entry)
 
-    # ファイル破損を防止するため一時ファイル経由で保存
+    # 最大件数を超えている場合、古い順に消去（ただしピン留めされている通知は保護）
+    if len(data) > max_count:
+        excess = len(data) - max_count
+        new_data = []
+        removed_count = 0
+        for item in data:
+            # 古いものでピン留めされていないものは除外
+            if removed_count < excess and item.get("id") not in pinned_ids:
+                removed_count += 1
+                continue
+            new_data.append(item)
+        data = new_data
+
+    # 一時ファイル経由でアトミック保存
     temp_file = f"{LOG_FILE}.tmp"
     with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(temp_file, LOG_FILE)
 
+    # UIが開いていればリアルタイム反映
+    if ui_app:
+        try:
+            ui_app.after(0, ui_app.refresh_logs)
+        except Exception:
+            pass
+
 
 async def delete_notification_after_delay(listener: mgmt.UserNotificationListener, notif_id: int, delay: int):
     """指定秒数待機した後に通知を画面および通知センターから削除する非同期タスク"""
     await asyncio.sleep(delay)
-    # 一時停止に切り替わっていないか再確認
-    if not is_auto_delete_enabled:
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ⏸️ [スキップ] 一時停止中のため通知ID: {notif_id} の削除を保留しました。")
+
+    # 設定で自動削除が無効化されていないか確認
+    cfg = config.get_config()
+    if not cfg.get("auto_delete_enabled", True):
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ⏸️ [スキップ] 自動削除一時停止中のため通知ID: {notif_id} の削除を保留しました。")
         return
 
     try:
         listener.remove_notification(notif_id)
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🗑️ [自動削除完了] 通知ID: {notif_id}")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🗑️ [自動削除完了] 通知ID: {notif_id}（{delay}秒後）")
     except Exception as e:
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ⚠️ [削除失敗] 通知ID: {notif_id} (理由: {e})")
 
@@ -194,7 +211,7 @@ async def notification_monitor_loop():
     print("  Discord 通知マネージャー 起動中...")
     print("========================================")
 
-    # 1. UserNotificationListener の権限確認
+    # 1. 権限確認
     listener = mgmt.UserNotificationListener.current
     access_status = await listener.request_access_async()
 
@@ -205,11 +222,14 @@ async def notification_monitor_loop():
 
     print("✅ 通知アクセス権限: 許可されています")
 
-    # 2. 起動時点で既に存在する通知をスキップ対象として登録
+    # 2. 既存通知をスキップ対象として登録
     initial_notifications = await listener.get_notifications_async(notifications.NotificationKinds.TOAST)
     seen_ids = {item.id for item in initial_notifications}
     print(f"ℹ️ 現在の既存通知: {len(seen_ids)} 件をスキップ対象として登録しました。")
-    print(f"🚀 新着Discord通知の常時監視を開始しました（{AUTO_DELETE_DELAY_SECONDS}秒後に自動削除）...")
+
+    cfg = config.get_config()
+    delay_sec = cfg.get("auto_delete_delay_seconds", 3)
+    print(f"🚀 新着Discord通知の常時監視を開始しました（{delay_sec}秒後に自動削除）...")
 
     # 3. 監視ループ
     while not stop_event.is_set():
@@ -219,7 +239,6 @@ async def notification_monitor_loop():
             for item in current_notifications:
                 notif_id = item.id
 
-                # 処理済みの通知はスキップ
                 if notif_id in seen_ids:
                     continue
 
@@ -233,18 +252,17 @@ async def notification_monitor_loop():
                     if not app_name and hasattr(item.app_info, "id"):
                         app_name = item.app_info.id or ""
 
-                # Discord通知か判定
                 if "discord" not in app_name.lower():
                     continue
 
-                # 受信日時の取得
+                # 受信日時
                 received_dt = item.creation_time
                 if received_dt:
                     local_dt_str = received_dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                 else:
                     local_dt_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # タイトルおよび本文テキストの抽出
+                # タイトル・本文の抽出
                 texts = []
                 if item.notification and item.notification.visual:
                     for binding in item.notification.visual.bindings:
@@ -254,15 +272,19 @@ async def notification_monitor_loop():
                 title = texts[0] if len(texts) > 0 else "（タイトルなし）"
                 body = "\n".join(texts[1:]) if len(texts) > 1 else "（本文なし）"
 
-                # コンソールに表示
-                status_label = "🔔 [Discord新着通知検知]" if is_auto_delete_enabled else "🔔 [Discord新着通知検知 (自動削除一時停止中)]"
+                # 現在の設定を再取得
+                current_cfg = config.get_config()
+                is_enabled = current_cfg.get("auto_delete_enabled", True)
+                current_delay = current_cfg.get("auto_delete_delay_seconds", 3)
+
+                status_label = "🔔 [Discord新着通知検知]" if is_enabled else "🔔 [Discord新着通知検知 (自動削除一時停止中)]"
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {status_label}")
                 print(f"  ・ID    : {notif_id}")
                 print(f"  ・日時  : {local_dt_str}")
                 print(f"  ・送信元: {title}")
                 print(f"  ・内容  : {body}")
 
-                # JSONログに保存（一時停止中でもログ保存は行う）
+                # JSONログに保存
                 log_entry = {
                     "id": notif_id,
                     "received_at": local_dt_str,
@@ -273,16 +295,15 @@ async def notification_monitor_loop():
                 save_notification_log(log_entry)
                 print(f"  💾 -> '{LOG_FILE}' に保存しました。")
 
-                # 自動削除タスクを開始（有効時のみ）
-                if is_auto_delete_enabled:
+                # 自動削除タスクを開始
+                if is_enabled:
                     asyncio.create_task(
-                        delete_notification_after_delay(listener, notif_id, AUTO_DELETE_DELAY_SECONDS)
+                        delete_notification_after_delay(listener, notif_id, current_delay)
                     )
 
         except Exception as e:
             print(f"監視ループ内で例外が発生しました: {e}")
 
-        # ポーリング待機
         await asyncio.sleep(POLLING_INTERVAL_SECONDS)
 
 
@@ -294,22 +315,33 @@ def run_async_loop():
 # ==============================================================================
 # タスクトレイUI関連 (pystray)
 # ==============================================================================
+def update_tray_state(enabled: bool):
+    """トレイアイコンの見た目とツールチップを更新"""
+    if not tray_icon:
+        return
+    tray_icon.icon = create_tray_image(enabled)
+    delay_sec = config.get_config().get("auto_delete_delay_seconds", 3)
+    status_text = f"監視中 ({delay_sec}秒後に自動削除)" if enabled else "一時停止中 (ログ保存のみ)"
+    tray_icon.title = f"Discord通知マネージャー - {status_text}"
+
+
 def on_toggle_auto_delete(icon, item):
-    """自動削除の有効/一時停止を切り替えるハンドラー"""
-    global is_auto_delete_enabled
-    is_auto_delete_enabled = not is_auto_delete_enabled
+    """トレイメニューから自動削除の有効/一時停止を切り替えるハンドラー"""
+    cfg = config.get_config()
+    new_state = not cfg.get("auto_delete_enabled", True)
+    config.update_config_value("auto_delete_enabled", new_state)
+    update_tray_state(new_state)
 
-    # アイコンとツールチップの更新
-    icon.icon = create_tray_image(is_auto_delete_enabled)
-    status_text = "監視中 (3秒後に自動削除)" if is_auto_delete_enabled else "一時停止中 (ログ保存のみ)"
-    icon.title = f"Discord通知マネージャー - {status_text}"
-    print(f"ℹ️ 自動削除を {'有効' if is_auto_delete_enabled else '一時停止'} に切り替えました。")
+    if ui_app:
+        ui_app.after(0, ui_app._load_settings_into_form)
+
+    print(f"ℹ️ 自動削除を {'有効' if new_state else '一時停止'} に切り替えました。")
 
 
-def on_toggle_startup(icon, item):
-    """スタートアップ登録の切り替えハンドラー"""
-    current_state = is_startup_enabled()
-    set_startup_enabled(not current_state)
+def on_open_gui(icon, item):
+    """管理画面GUI（CustomTkinter）を開くハンドラー"""
+    if ui_app:
+        ui_app.after(0, ui_app.show_window)
 
 
 def on_open_log(icon, item):
@@ -331,24 +363,48 @@ def on_open_folder(icon, item):
         print(f"フォルダを開けませんでした: {e}")
 
 
+def on_toggle_startup(icon, item):
+    """スタートアップ登録の切り替えハンドラー"""
+    current_state = is_startup_enabled()
+    set_startup_enabled(not current_state)
+
+
 def on_exit(icon, item):
     """アプリ終了ハンドラー"""
     print("👋 終了処理を実行しています...")
     stop_event.set()
-    icon.stop()
+    if tray_icon:
+        tray_icon.stop()
+    if ui_app:
+        ui_app.after(0, ui_app.destroy)
 
 
-def setup_tray():
-    """タスクトレイアイコンとメニューを初期化して起動する関数"""
-    global tray_icon
+def on_config_changed_from_ui(new_config: Dict[str, Any]):
+    """UI側で設定が保存された際の通知ハンドラー"""
+    enabled = new_config.get("auto_delete_enabled", True)
+    update_tray_state(enabled)
 
-    # メニュー項目の組み立て
+
+def setup_tray_and_app():
+    """タスクトレイとCustomTkinter GUIを初期化してメインループを開始"""
+    global tray_icon, ui_app
+
+    # 設定ファイルのロード
+    cfg = config.load_config()
+    is_enabled = cfg.get("auto_delete_enabled", True)
+
+    # 1. CustomTkinter UI のインスタンス化（メインスレッドで実行）
+    ui_app = ui.DiscordNotifyManagerUI(LOG_FILE, on_config_changed=on_config_changed_from_ui)
+    ui_app.withdraw()  # 初期状態はタスクトレイ常駐のため非表示
+
+    # 2. タスクトレイアイコンとメニューの定義
     menu = pystray.Menu(
+        pystray.MenuItem("🖥️ 管理画面（ログ・設定）を開く", on_open_gui, default=True),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem(
-            lambda text: "自動削除: 有効 (クリックで一時停止)" if is_auto_delete_enabled else "自動削除: 一時停止中 (クリックで再開)",
+            lambda text: "自動削除: 有効 (クリックで一時停止)" if config.get_config().get("auto_delete_enabled", True) else "自動削除: 一時停止中 (クリックで再開)",
             on_toggle_auto_delete,
         ),
-        pystray.Menu.SEPARATOR,
         pystray.MenuItem("通知ログ (JSON) を開く", on_open_log),
         pystray.MenuItem("保存先フォルダを開く", on_open_folder),
         pystray.Menu.SEPARATOR,
@@ -361,29 +417,36 @@ def setup_tray():
         pystray.MenuItem("終了", on_exit),
     )
 
-    initial_image = create_tray_image(True)
+    initial_image = create_tray_image(is_enabled)
+    delay_sec = cfg.get("auto_delete_delay_seconds", 3)
+    status_text = f"監視中 ({delay_sec}秒後に自動削除)" if is_enabled else "一時停止中 (ログ保存のみ)"
     tray_icon = pystray.Icon(
         "DiscordNotifyManager",
         initial_image,
-        "Discord通知マネージャー - 監視中 (3秒後に自動削除)",
+        f"Discord通知マネージャー - {status_text}",
         menu=menu,
     )
 
-    # バックグラウンドスレッドで非同期通知監視を開始
+    # 3. バックグラウンドスレッドで通知監視ループを開始
     monitor_thread = threading.Thread(target=run_async_loop, daemon=True)
     monitor_thread.start()
 
-    # メインスレッドでタスクトレイのイベントループを開始（ブロッキング）
+    # 4. タスクトレイアイコンをデタッチ（別スレッド）で起動
+    tray_icon.run_detached()
+
+    # 5. メインスレッドで CustomTkinter の mainloop を実行
     try:
-        tray_icon.run()
-    except KeyboardInterrupt:
-        print("\n👋 Ctrl+C により終了しました。")
+        ui_app.mainloop()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
         stop_event.set()
-        tray_icon.stop()
+        if tray_icon:
+            tray_icon.stop()
 
 
 # ==============================================================================
 # エントリーポイント
 # ==============================================================================
 if __name__ == "__main__":
-    setup_tray()
+    setup_tray_and_app()
