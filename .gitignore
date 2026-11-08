@@ -23,3 +23,5 @@ download_wheels.py
 build/
 dist/
 *.spec
+
+.tmp.driveupload/

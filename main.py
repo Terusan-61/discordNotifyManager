@@ -164,7 +164,6 @@ def save_notification_log(entry: dict):
         new_data = []
         removed_count = 0
         for item in data:
-            # 古いものでピン留めされていないものは除外
             if removed_count < excess and item.get("id") not in pinned_ids:
                 removed_count += 1
                 continue
@@ -229,7 +228,8 @@ async def notification_monitor_loop():
 
     cfg = config.get_config()
     delay_sec = cfg.get("auto_delete_delay_seconds", 3)
-    print(f"🚀 新着Discord通知の常時監視を開始しました（{delay_sec}秒後に自動削除）...")
+    save_log = cfg.get("save_log_enabled", True)
+    print(f"🚀 新着Discord通知の常時監視を開始しました（{delay_sec}秒後に自動削除 / ログ保存: {'ON' if save_log else 'OFF'}）...")
 
     # 3. 監視ループ
     while not stop_event.is_set():
@@ -276,6 +276,7 @@ async def notification_monitor_loop():
                 current_cfg = config.get_config()
                 is_enabled = current_cfg.get("auto_delete_enabled", True)
                 current_delay = current_cfg.get("auto_delete_delay_seconds", 3)
+                is_save_log_enabled = current_cfg.get("save_log_enabled", True)
 
                 status_label = "🔔 [Discord新着通知検知]" if is_enabled else "🔔 [Discord新着通知検知 (自動削除一時停止中)]"
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {status_label}")
@@ -284,16 +285,19 @@ async def notification_monitor_loop():
                 print(f"  ・送信元: {title}")
                 print(f"  ・内容  : {body}")
 
-                # JSONログに保存
-                log_entry = {
-                    "id": notif_id,
-                    "received_at": local_dt_str,
-                    "app_name": app_name,
-                    "title": title,
-                    "body": body,
-                }
-                save_notification_log(log_entry)
-                print(f"  💾 -> '{LOG_FILE}' に保存しました。")
+                # JSONログに保存（設定で有効な場合のみ）
+                if is_save_log_enabled:
+                    log_entry = {
+                        "id": notif_id,
+                        "received_at": local_dt_str,
+                        "app_name": app_name,
+                        "title": title,
+                        "body": body,
+                    }
+                    save_notification_log(log_entry)
+                    print(f"  💾 -> '{LOG_FILE}' に保存しました。")
+                else:
+                    print("  📝 -> [スキップ] ログ保存設定がオフのためファイル保存を省略しました。")
 
                 # 自動削除タスクを開始
                 if is_enabled:
@@ -321,7 +325,7 @@ def update_tray_state(enabled: bool):
         return
     tray_icon.icon = create_tray_image(enabled)
     delay_sec = config.get_config().get("auto_delete_delay_seconds", 3)
-    status_text = f"監視中 ({delay_sec}秒後に自動削除)" if enabled else "一時停止中 (ログ保存のみ)"
+    status_text = f"監視中 ({delay_sec}秒後に自動削除)" if enabled else "一時停止中"
     tray_icon.title = f"Discord通知マネージャー - {status_text}"
 
 
@@ -419,7 +423,7 @@ def setup_tray_and_app():
 
     initial_image = create_tray_image(is_enabled)
     delay_sec = cfg.get("auto_delete_delay_seconds", 3)
-    status_text = f"監視中 ({delay_sec}秒後に自動削除)" if is_enabled else "一時停止中 (ログ保存のみ)"
+    status_text = f"監視中 ({delay_sec}秒後に自動削除)" if is_enabled else "一時停止中"
     tray_icon = pystray.Icon(
         "DiscordNotifyManager",
         initial_image,
