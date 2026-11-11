@@ -20,6 +20,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 DEFAULT_CONFIG: Dict[str, Any] = {
     "auto_delete_delay_seconds": 3,      # 自動削除までの待機時間（秒）
     "max_log_count": 500,                # ログの最大保持件数（上限を超えると最も古いものを自動削除）
+    "items_per_page": 20,                # 1ページあたりの表示件数（ページネーション）
     "auto_delete_enabled": True,         # 自動削除機能が有効かどうか
     "save_log_enabled": True,            # 通知ログをファイルに保存するかどうか
     "pinned_notification_ids": [],       # ピン留め（あとで読む）された通知IDリスト

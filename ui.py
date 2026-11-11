@@ -2,14 +2,17 @@
 GUIモジュール (ui.py)
 CustomTkinter を使用した Discord通知マネージャー のモダンな管理画面
 - ログ一覧の表示・Enter/ボタン検索・フィルター（すべて / ピン留め / 本日）
+- 📄 ページネーション（ページめくり）機能（描画負荷・メモリ消費を大幅低減）
+- ✂️ 本文の長文制限（300文字超の自動省略）
 - 📌 ピン留め（あとで読む）機能
 - 🚀 Discordアプリのアクティブ化機能
 - 🧹 ログのワンクリック全消去機能
-- ⚙️ 設定の一元管理（自動削除秒数、最大件数の直接数値入力、ログ保存ON/OFFスイッチ）
+- ⚙️ 設定の一元管理（自動削除秒数、最大件数、1ページ表示件数、ログ保存切替）
 """
 
 import datetime
 import json
+import math
 import os
 import sys
 import tkinter.messagebox as messagebox
@@ -29,6 +32,9 @@ COLOR_GREEN = "#57F287"         # 稼働状態・成功
 COLOR_RED = "#ED4245"           # 削除・危険
 COLOR_TEXT_MUTED = "#949ba4"    # サブテキスト色
 
+# 本文の最大プレビュー文字数（長文によるUI圧迫を防止）
+MAX_BODY_PREVIEW_LENGTH = 300
+
 
 class DiscordNotifyManagerUI(ctk.CTk):
     def __init__(self, log_file_path: str, on_config_changed: Optional[Callable[[Dict[str, Any]], None]] = None):
@@ -39,8 +45,8 @@ class DiscordNotifyManagerUI(ctk.CTk):
 
         # ウィンドウの基本設定
         self.title("Discord 通知マネージャー")
-        self.geometry("800x660")
-        self.minsize(700, 520)
+        self.geometry("820x680")
+        self.minsize(720, 540)
 
         # CustomTkinterの外観モード設定
         ctk.set_appearance_mode("dark")
@@ -50,6 +56,11 @@ class DiscordNotifyManagerUI(ctk.CTk):
         self.all_logs: List[Dict[str, Any]] = []
         self.current_filter = "all"  # "all", "pinned", "today"
         self.search_keyword = ""
+
+        # ページネーション管理
+        self.current_page = 1
+        self.total_pages = 1
+        self.items_per_page = int(config.get_config().get("items_per_page", 20))
 
         # アイコンの設定（ファイルが存在する場合）
         icon_path = os.path.join(config.BASE_DIR, "icon.ico")
@@ -76,7 +87,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
             segmented_button_selected_color=COLOR_BLURPLE,
             segmented_button_selected_hover_color=COLOR_BLURPLE_HOVER,
         )
-        self.tabview.pack(fill="both", expand=True, padx=12, pady=10)
+        self.tabview.pack(fill="both", expand=True, padx=12, pady=8)
 
         self.tab_logs = self.tabview.add("📋 通知ログ一覧")
         self.tab_settings = self.tabview.add("⚙️ 設定")
@@ -100,7 +111,6 @@ class DiscordNotifyManagerUI(ctk.CTk):
             font=("Meiryo", 11),
         )
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        # Enterキーで検索を実行するようバインド
         self.search_entry.bind("<Return>", self._on_execute_search)
 
         # 🔍 検索ボタン
@@ -139,7 +149,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
         self.filter_segment.set("すべて")
         self.filter_segment.pack(side="left", padx=(0, 6))
 
-        # 更新ボタン
+        # 🔄 更新ボタン
         btn_refresh = ctk.CTkButton(
             top_bar,
             text="🔄 更新",
@@ -167,11 +177,75 @@ class DiscordNotifyManagerUI(ctk.CTk):
             fg_color=COLOR_BG_DARK,
             corner_radius=8,
         )
-        self.scroll_frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+        self.scroll_frame.pack(fill="both", expand=True, padx=4, pady=(0, 6))
 
-        # 4. フッターバー（下部）
+        # 4. ページネーション操作バー（ページめくり）
+        page_bar = ctk.CTkFrame(self.tab_logs, fg_color="transparent")
+        page_bar.pack(fill="x", padx=4, pady=(2, 6))
+
+        # ページ切り替えコントロールを中央揃えで配置するインナーフレーム
+        page_controls = ctk.CTkFrame(page_bar, fg_color="transparent")
+        page_controls.pack(anchor="center")
+
+        self.btn_first_page = ctk.CTkButton(
+            page_controls,
+            text="⏪ 最初",
+            width=65,
+            height=30,
+            fg_color="#3b3e45",
+            hover_color="#474b53",
+            font=("Meiryo", 10),
+            command=self._go_first_page,
+        )
+        self.btn_first_page.pack(side="left", padx=4)
+
+        self.btn_prev_page = ctk.CTkButton(
+            page_controls,
+            text="◀ 前へ",
+            width=65,
+            height=30,
+            fg_color=COLOR_BLURPLE,
+            hover_color=COLOR_BLURPLE_HOVER,
+            font=("Meiryo", 10),
+            command=self._go_prev_page,
+        )
+        self.btn_prev_page.pack(side="left", padx=4)
+
+        self.lbl_page_info = ctk.CTkLabel(
+            page_controls,
+            text="1 / 1 ページ",
+            font=("Meiryo", 12, "bold"),
+            width=110,
+        )
+        self.lbl_page_info.pack(side="left", padx=8)
+
+        self.btn_next_page = ctk.CTkButton(
+            page_controls,
+            text="次へ ▶",
+            width=65,
+            height=30,
+            fg_color=COLOR_BLURPLE,
+            hover_color=COLOR_BLURPLE_HOVER,
+            font=("Meiryo", 10),
+            command=self._go_next_page,
+        )
+        self.btn_next_page.pack(side="left", padx=4)
+
+        self.btn_last_page = ctk.CTkButton(
+            page_controls,
+            text="最後 ⏩",
+            width=65,
+            height=30,
+            fg_color="#3b3e45",
+            hover_color="#474b53",
+            font=("Meiryo", 10),
+            command=self._go_last_page,
+        )
+        self.btn_last_page.pack(side="left", padx=4)
+
+        # 5. フッターバー（最下部）
         bottom_bar = ctk.CTkFrame(self.tab_logs, fg_color="transparent")
-        bottom_bar.pack(fill="x", padx=4, pady=(0, 4))
+        bottom_bar.pack(fill="x", padx=4, pady=(2, 4))
 
         # 🧹 全消去ボタン
         btn_clear = ctk.CTkButton(
@@ -234,7 +308,31 @@ class DiscordNotifyManagerUI(ctk.CTk):
         )
         self.slider_delay.pack(side="left", fill="x", expand=True, padx=10)
 
-        # 項目2: ログ最大保持件数 (直接数値入力)
+        # 項目2: 1ページあたりの表示件数（ページネーション設定）
+        lbl_page_title = ctk.CTkLabel(container, text="📄 1ページあたりの表示件数", font=("Meiryo", 14, "bold"), anchor="w")
+        lbl_page_title.pack(fill="x", pady=(10, 2))
+
+        lbl_page_desc = ctk.CTkLabel(
+            container,
+            text="一覧画面で1ページに表示する通知カードの件数を設定します。件数を抑えることで描画が非常に軽快になります。",
+            font=("Meiryo", 11),
+            text_color=COLOR_TEXT_MUTED,
+            anchor="w",
+        )
+        lbl_page_desc.pack(fill="x", pady=(0, 8))
+
+        page_setting_frame = ctk.CTkFrame(container, fg_color=COLOR_BG_DARK, corner_radius=8)
+        page_setting_frame.pack(fill="x", pady=(0, 15), ipady=8, ipadx=10)
+
+        self.segment_items_per_page = ctk.CTkSegmentedButton(
+            page_setting_frame,
+            values=["10 件", "20 件", "50 件"],
+            selected_color=COLOR_BLURPLE,
+            selected_hover_color=COLOR_BLURPLE_HOVER,
+        )
+        self.segment_items_per_page.pack(fill="x", padx=10, pady=5)
+
+        # 項目3: ログ最大保持件数 (直接数値入力)
         lbl_max_title = ctk.CTkLabel(container, text="📦 ログの最大保持件数（直接数値入力）", font=("Meiryo", 14, "bold"), anchor="w")
         lbl_max_title.pack(fill="x", pady=(10, 2))
 
@@ -250,7 +348,6 @@ class DiscordNotifyManagerUI(ctk.CTk):
         max_frame = ctk.CTkFrame(container, fg_color=COLOR_BG_DARK, corner_radius=8)
         max_frame.pack(fill="x", pady=(0, 15), ipady=8, ipadx=10)
 
-        # 直接入力用エントリ
         self.entry_max_count = ctk.CTkEntry(
             max_frame,
             width=140,
@@ -263,7 +360,6 @@ class DiscordNotifyManagerUI(ctk.CTk):
         lbl_unit = ctk.CTkLabel(max_frame, text="件", font=("Meiryo", 13))
         lbl_unit.pack(side="left", padx=(0, 15))
 
-        # プリセットショートカットボタン
         for preset_val in [100, 500, 1000]:
             btn_preset = ctk.CTkButton(
                 max_frame,
@@ -277,7 +373,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
             )
             btn_preset.pack(side="left", padx=4)
 
-        # 項目3: 自動削除機能の有効 / 無効
+        # 項目4: 自動削除機能の有効 / 無効
         lbl_enable_title = ctk.CTkLabel(container, text="🔔 自動削除機能の有効化", font=("Meiryo", 14, "bold"), anchor="w")
         lbl_enable_title.pack(fill="x", pady=(10, 2))
 
@@ -301,7 +397,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
         )
         self.switch_auto_delete.pack(side="left", padx=15, pady=5)
 
-        # 項目4: ログ保存機能の有効 / 無効
+        # 項目5: ログ保存機能の有効 / 無効
         lbl_save_title = ctk.CTkLabel(container, text="📝 通知ログの保存機能の有効化", font=("Meiryo", 14, "bold"), anchor="w")
         lbl_save_title.pack(fill="x", pady=(10, 2))
 
@@ -353,6 +449,15 @@ class DiscordNotifyManagerUI(ctk.CTk):
         self.slider_delay.set(delay)
         self.lbl_delay_val.configure(text=f"{delay} 秒")
 
+        # 1ページあたりの件数
+        per_page = int(cfg.get("items_per_page", 20))
+        self.items_per_page = per_page
+        per_page_str = f"{per_page} 件"
+        if per_page_str in ["10 件", "20 件", "50 件"]:
+            self.segment_items_per_page.set(per_page_str)
+        else:
+            self.segment_items_per_page.set("20 件")
+
         # 最大件数（数値エントリ）
         max_cnt = cfg.get("max_log_count", 500)
         self.entry_max_count.delete(0, "end")
@@ -380,6 +485,14 @@ class DiscordNotifyManagerUI(ctk.CTk):
         # 秒数
         cfg["auto_delete_delay_seconds"] = int(self.slider_delay.get())
 
+        # 1ページあたりの件数
+        selected_per_page = self.segment_items_per_page.get()
+        try:
+            self.items_per_page = int(selected_per_page.replace(" 件", ""))
+        except Exception:
+            self.items_per_page = 20
+        cfg["items_per_page"] = self.items_per_page
+
         # 最大件数のバリデーション
         raw_max = self.entry_max_count.get().strip()
         try:
@@ -400,7 +513,34 @@ class DiscordNotifyManagerUI(ctk.CTk):
         if self.on_config_changed:
             self.on_config_changed(cfg)
 
+        # ページを1に戻して再描画
+        self.current_page = 1
+        self._render_log_cards()
+
         messagebox.showinfo("設定完了", "設定を正常に保存しました！")
+
+    # ==========================================================================
+    # ページネーション操作
+    # ==========================================================================
+    def _go_first_page(self):
+        if self.current_page > 1:
+            self.current_page = 1
+            self._render_log_cards()
+
+    def _go_prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self._render_log_cards()
+
+    def _go_next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self._render_log_cards()
+
+    def _go_last_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page = self.total_pages
+            self._render_log_cards()
 
     # ==========================================================================
     # ログデータの読み込み・描画処理
@@ -432,8 +572,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
             pass
 
     def _render_log_cards(self):
-        """現在の検索キーワード・フィルターに基づいてカードを描画"""
-        # 描画前にスクロール位置を最上部にリセット
+        """現在の検索キーワード・フィルター・ページ番号に基づいてカードを描画"""
         self._reset_scroll_position()
 
         # 既存のカードウィジェットを全て削除
@@ -465,16 +604,39 @@ class DiscordNotifyManagerUI(ctk.CTk):
 
             filtered.append(item)
 
-        # 最新の通知が一番上に来るように逆順表示
+        # 最新の通知が一番上に来るように逆順
         filtered_reversed = list(reversed(filtered))
+        total_items = len(filtered_reversed)
+
+        # ページネーションの計算
+        self.total_pages = max(1, math.ceil(total_items / self.items_per_page))
+        self.current_page = max(1, min(self.current_page, self.total_pages))
+
+        # ページネーションボタンの活性/非活性状態の更新
+        self.btn_first_page.configure(state="normal" if self.current_page > 1 else "disabled")
+        self.btn_prev_page.configure(state="normal" if self.current_page > 1 else "disabled")
+        self.btn_next_page.configure(state="normal" if self.current_page < self.total_pages else "disabled")
+        self.btn_last_page.configure(state="normal" if self.current_page < self.total_pages else "disabled")
+        self.lbl_page_info.configure(text=f"{self.current_page} / {self.total_pages} ページ")
+
+        # 表示範囲のスライス計算
+        start_idx = (self.current_page - 1) * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, total_items)
+        page_items = filtered_reversed[start_idx:end_idx]
 
         # 件数表示の更新
         search_hint = f"（検索: '{self.search_keyword}'）" if self.search_keyword else ""
-        self.lbl_count.configure(
-            text=f"表示中: {len(filtered_reversed)} 件 / 全 {len(self.all_logs)} 件 {search_hint}"
-        )
+        if total_items > 0:
+            range_str = f"{start_idx + 1}〜{end_idx} 件目"
+            self.lbl_count.configure(
+                text=f"表示中: {range_str} / 該当 {total_items} 件 (全 {len(self.all_logs)} 件) {search_hint}"
+            )
+        else:
+            self.lbl_count.configure(
+                text=f"表示中: 0 件 / 該当 0 件 (全 {len(self.all_logs)} 件) {search_hint}"
+            )
 
-        if not filtered_reversed:
+        if not page_items:
             lbl_empty = ctk.CTkLabel(
                 self.scroll_frame,
                 text="該当する通知ログはありません。",
@@ -484,8 +646,8 @@ class DiscordNotifyManagerUI(ctk.CTk):
             lbl_empty.pack(pady=40)
             return
 
-        # 各ログのカードを生成
-        for entry in filtered_reversed:
+        # 該当ページの通知カードのみを生成（負荷最小限！）
+        for entry in page_items:
             self._create_log_card(entry, pinned_ids)
 
         # 描画完了後にスクロール領域を再計算し、最上部に固定
@@ -541,11 +703,15 @@ class DiscordNotifyManagerUI(ctk.CTk):
         )
         btn_pin.pack(side="right")
 
-        # 本文
+        # 本文（長文の場合は自動省略してUI圧迫を防止）
         if body:
+            display_body = body
+            if len(body) > MAX_BODY_PREVIEW_LENGTH:
+                display_body = body[:MAX_BODY_PREVIEW_LENGTH] + "\n... (以下長文のため省略)"
+
             lbl_body = ctk.CTkLabel(
                 card,
-                text=body,
+                text=display_body,
                 font=("Meiryo", 11),
                 anchor="w",
                 justify="left",
@@ -575,12 +741,14 @@ class DiscordNotifyManagerUI(ctk.CTk):
     def _on_execute_search(self, event=None):
         """Enterキーまたは検索ボタンが押された時に検索を実行"""
         self.search_keyword = self.search_entry.get().strip()
+        self.current_page = 1  # 検索時は1ページ目に戻す
         self._render_log_cards()
 
     def _on_clear_search(self):
         """検索ワードをクリアして全件表示に戻す"""
         self.search_entry.delete(0, "end")
         self.search_keyword = ""
+        self.current_page = 1
         self._render_log_cards()
 
     def _on_filter_changed(self, value):
@@ -590,6 +758,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
             self.current_filter = "today"
         else:
             self.current_filter = "all"
+        self.current_page = 1  # フィルター切り替え時は1ページ目に戻す
         self._render_log_cards()
 
     def _toggle_pin(self, notif_id: int):
@@ -620,6 +789,7 @@ class DiscordNotifyManagerUI(ctk.CTk):
                 with open(self.log_file_path, "w", encoding="utf-8") as f:
                     f.write("[]\n")
                 self.all_logs = []
+                self.current_page = 1
                 self._render_log_cards()
                 messagebox.showinfo("完了", "すべての通知ログを消去しました。")
             except Exception as e:
